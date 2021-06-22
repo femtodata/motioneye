@@ -3,8 +3,8 @@ services:
   motioneye:
     restart: unless-stopped
     image: femtodata/motioneye:dev-amd64  # dev image
-    devices:
-      - "/dev/video0:/dev/video0"
-      - "/dev/video1:/dev/video1"
+    # devices:
+    #   - "/dev/video0:/dev/video0"
+    #   - "/dev/video1:/dev/video1"
     volumes:
       - /etc/localtime:/etc/localtime:ro
