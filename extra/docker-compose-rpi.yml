@@ -1,0 +1,20 @@
+---
+version: "3.5"
+services:
+  motioneye:
+    restart: unless-stopped
+    image: femtodata/motioneye:dev-armhf
+    devices:
+      - "/dev/video0:/dev/video0"
+      - "/dev/video1:/dev/video1"
+    ports:
+      - "8081:8081"
+      - "8765:8765"
+    volumes:
+      - "./etc_motioneye:/etc/motioneye"
+      - "./var_lib_motioneye:/var/lib/motioneye"
+      - /etc/localtime:/etc/localtime:ro
+
+# volumes:
+#   etc_motioneye:
+#   var_lib_motioneye:
