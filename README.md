@@ -26,4 +26,5 @@ to deploy:
   cd motioneye
   docker-compose -f docker-compose-rpi.yml up -d
   ```
+- **SET ADMIN AND USER PASSWORDS!**
 
