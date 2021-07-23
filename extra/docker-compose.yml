@@ -2,6 +2,7 @@
 version: "3.5"
 services:
   motioneye:
+    restart: unless-stopped
     image: femtodata/motioneye:dev-amd64
     ports:
       - "8081:8081"
@@ -9,6 +10,7 @@ services:
     volumes:
       - "./etc_motioneye:/etc/motioneye"
       - "./var_lib_motioneye:/var/lib/motioneye"
+      - /etc/localtime:/etc/localtime:ro
 
 # volumes:
 #   etc_motioneye:
