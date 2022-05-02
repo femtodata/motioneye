@@ -1,0 +1,4 @@
+docker_images/
+.git/
+.github/
+scripts/
