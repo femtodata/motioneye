@@ -1,4 +1,3 @@
-
 # Copyright (c) 2013 Calin Crisan
 # This file is part of motionEye.
 #
@@ -23,13 +22,11 @@ import signal
 import subprocess
 import time
 
+from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 from tornado.ioloop import IOLoop
 
-import mediafiles
-import powerctl
-import settings
-import update
-import utils
+from motioneye import mediafiles, settings, update, utils
+from motioneye.controls.powerctl import PowerControl
 
 _MOTION_CONTROL_TIMEOUT = 5
 
@@ -52,13 +49,13 @@ def find_motion():
 
     else:  # autodetect motion binary path
         try:
-            binary = subprocess.check_output(['which', 'motion'], stderr=utils.DEV_NULL).strip()
+            binary = utils.call_subprocess(['which', 'motion'])
 
         except subprocess.CalledProcessError:  # not found
             return None, None
 
     try:
-        help = subprocess.check_output(binary + ' -h || true', shell=True)
+        help = utils.call_subprocess(binary + ' -h || true', shell=True)
 
     except subprocess.CalledProcessError:  # not found
         return None, None
@@ -74,8 +71,7 @@ def find_motion():
 
 
 def start(deferred=False):
-    import config
-    import mjpgclient
+    from motioneye import config, mjpgclient
 
     if deferred:
         io_loop = IOLoop.instance()
@@ -119,10 +115,12 @@ def start(deferred=False):
 
     log_file = open(motion_log_path, 'w')
 
-    process = subprocess.Popen(args, stdout=log_file, stderr=log_file, close_fds=True, cwd=settings.CONF_PATH)
+    process = subprocess.Popen(
+        args, stdout=log_file, stderr=log_file, close_fds=True, cwd=settings.CONF_PATH
+    )
 
     # wait 2 seconds to see that the process has successfully started
-    for i in xrange(20):  # @UnusedVariable
+    for i in range(20):  # @UnusedVariable
         time.sleep(0.1)
         exit_code = process.poll()
         if exit_code is not None and exit_code != 0:
@@ -134,7 +132,7 @@ def start(deferred=False):
     with open(motion_pid_path, 'w') as f:
         f.write(str(pid) + '\n')
 
-    _disable_initial_motion_detection()
+    IOLoop.instance().spawn_callback(_disable_initial_motion_detection)
 
     # if mjpg client idle timeout is disabled, create mjpg clients for all cameras by default
     if not settings.MJPG_CLIENT_IDLE_TIMEOUT:
@@ -144,7 +142,7 @@ def start(deferred=False):
 
 
 def stop(invalidate=False):
-    import mjpgclient
+    from motioneye import mjpgclient
 
     global _started
 
@@ -164,7 +162,7 @@ def stop(invalidate=False):
             os.kill(pid, signal.SIGTERM)
 
             # wait 5 seconds for the process to exit
-            for i in xrange(50):  # @UnusedVariable
+            for i in range(50):  # @UnusedVariable
                 os.waitpid(pid, os.WNOHANG)
                 time.sleep(0.1)
 
@@ -172,14 +170,14 @@ def stop(invalidate=False):
             os.kill(pid, signal.SIGKILL)
 
             # wait 2 seconds for the process to exit
-            for i in xrange(20):  # @UnusedVariable
+            for i in range(20):  # @UnusedVariable
                 time.sleep(0.1)
                 os.waitpid(pid, os.WNOHANG)
 
             # the process still did not exit
             if settings.ENABLE_REBOOT:
                 logging.error('could not terminate the motion process')
-                powerctl.reboot()
+                PowerControl.reboot()
 
             else:
                 raise Exception('could not terminate the motion process')
@@ -212,96 +210,111 @@ def started():
     return _started
 
 
-def get_motion_detection(camera_id, callback):
-    from tornado.httpclient import HTTPRequest, AsyncHTTPClient
-
+async def get_motion_detection(camera_id) -> utils.GetMotionDetectionResult:
     motion_camera_id = camera_id_to_motion_camera_id(camera_id)
     if motion_camera_id is None:
         error = 'could not find motion camera id for camera with id %s' % camera_id
         logging.error(error)
-        return callback(error=error)
+        return utils.GetMotionDetectionResult(None, error=error)
 
-    url = 'http://127.0.0.1:%(port)s/%(id)s/detection/status' % {
-            'port': settings.MOTION_CONTROL_PORT, 'id': motion_camera_id}
+    url = 'http://127.0.0.1:{port}/{id}/detection/status'.format(
+        port=settings.MOTION_CONTROL_PORT, id=motion_camera_id
+    )
 
-    def on_response(response):
-        if response.error:
-            return callback(error=utils.pretty_http_error(response))
+    request = HTTPRequest(
+        url,
+        connect_timeout=_MOTION_CONTROL_TIMEOUT,
+        request_timeout=_MOTION_CONTROL_TIMEOUT,
+    )
+    resp = await AsyncHTTPClient().fetch(request)
+    if resp.error:
+        return utils.GetMotionDetectionResult(None, error=utils.pretty_http_error(resp))
 
-        enabled = bool(response.body.lower().count('active'))
+    resp_body = resp.body.decode('utf-8')
+    enabled = bool(resp_body.count('active'))
 
-        logging.debug('motion detection is %(what)s for camera with id %(id)s' % {
-                'what': ['disabled', 'enabled'][enabled],
-                'id': camera_id})
+    logging.debug(
+        'motion detection is {what} for camera with id {id}'.format(
+            what=['disabled', 'enabled'][enabled], id=camera_id
+        )
+    )
 
-        callback(enabled)
-
-    request = HTTPRequest(url, connect_timeout=_MOTION_CONTROL_TIMEOUT, request_timeout=_MOTION_CONTROL_TIMEOUT)
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, callback=on_response)
+    return utils.GetMotionDetectionResult(enabled, None)
 
 
-def set_motion_detection(camera_id, enabled):
-    from tornado.httpclient import HTTPRequest, AsyncHTTPClient
-
+async def set_motion_detection(camera_id, enabled):
     motion_camera_id = camera_id_to_motion_camera_id(camera_id)
     if motion_camera_id is None:
-        return logging.error('could not find motion camera id for camera with id %s' % camera_id)
+        return logging.error(
+            'could not find motion camera id for camera with id %s' % camera_id
+        )
 
     if not enabled:
         _motion_detected[camera_id] = False
 
-    logging.debug('%(what)s motion detection for camera with id %(id)s' % {
-            'what': ['disabling', 'enabling'][enabled],
-            'id': camera_id})
+    logging.debug(
+        '{what} motion detection for camera with id {id}'.format(
+            what=['disabling', 'enabling'][enabled], id=camera_id
+        )
+    )
 
-    url = 'http://127.0.0.1:%(port)s/%(id)s/detection/%(enabled)s' % {
-            'port': settings.MOTION_CONTROL_PORT,
-            'id': motion_camera_id,
-            'enabled': ['pause', 'start'][enabled]}
+    url = 'http://127.0.0.1:{port}/{id}/detection/{enabled}'.format(
+        port=settings.MOTION_CONTROL_PORT,
+        id=motion_camera_id,
+        enabled=['pause', 'start'][enabled],
+    )
 
-    def on_response(response):
-        if response.error:
-            logging.error('failed to %(what)s motion detection for camera with id %(id)s: %(msg)s' % {
-                    'what': ['disable', 'enable'][enabled],
-                    'id': camera_id,
-                    'msg': utils.pretty_http_error(response)})
+    request = HTTPRequest(
+        url,
+        connect_timeout=_MOTION_CONTROL_TIMEOUT,
+        request_timeout=_MOTION_CONTROL_TIMEOUT,
+    )
+    resp = await AsyncHTTPClient().fetch(request)
+    if resp.error:
+        logging.error(
+            'failed to {what} motion detection for camera with id {id}: {msg}'.format(
+                what=['disable', 'enable'][enabled],
+                id=camera_id,
+                msg=utils.pretty_http_error(resp),
+            )
+        )
 
-        else:
-            logging.debug('successfully %(what)s motion detection for camera with id %(id)s' % {
-                    'what': ['disabled', 'enabled'][enabled],
-                    'id': camera_id})
-
-    request = HTTPRequest(url, connect_timeout=_MOTION_CONTROL_TIMEOUT, request_timeout=_MOTION_CONTROL_TIMEOUT)
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, on_response)
+    else:
+        logging.debug(
+            'successfully {what} motion detection for camera with id {id}'.format(
+                what=['disabled', 'enabled'][enabled], id=camera_id
+            )
+        )
 
 
-def take_snapshot(camera_id):
-    from tornado.httpclient import HTTPRequest, AsyncHTTPClient
-
+async def take_snapshot(camera_id):
     motion_camera_id = camera_id_to_motion_camera_id(camera_id)
     if motion_camera_id is None:
-        return logging.error('could not find motion camera id for camera with id %s' % camera_id)
+        return logging.error(
+            'could not find motion camera id for camera with id %s' % camera_id
+        )
 
-    logging.debug('taking snapshot for camera with id %(id)s' % {'id': camera_id})
+    logging.debug(f'taking snapshot for camera with id {camera_id}')
 
-    url = 'http://127.0.0.1:%(port)s/%(id)s/action/snapshot' % {
-            'port': settings.MOTION_CONTROL_PORT,
-            'id': motion_camera_id}
+    url = 'http://127.0.0.1:{port}/{id}/action/snapshot'.format(
+        port=settings.MOTION_CONTROL_PORT, id=motion_camera_id
+    )
 
-    def on_response(response):
-        if response.error:
-            logging.error('failed to take snapshot for camera with id %(id)s: %(msg)s' % {
-                    'id': camera_id,
-                    'msg': utils.pretty_http_error(response)})
+    request = HTTPRequest(
+        url,
+        connect_timeout=_MOTION_CONTROL_TIMEOUT,
+        request_timeout=_MOTION_CONTROL_TIMEOUT,
+    )
+    resp = await AsyncHTTPClient().fetch(request)
+    if resp.error:
+        logging.error(
+            'failed to take snapshot for camera with id {id}: {msg}'.format(
+                id=camera_id, msg=utils.pretty_http_error(resp)
+            )
+        )
 
-        else:
-            logging.debug('successfully took snapshot for camera with id %(id)s' % {'id': camera_id})
-
-    request = HTTPRequest(url, connect_timeout=_MOTION_CONTROL_TIMEOUT, request_timeout=_MOTION_CONTROL_TIMEOUT)
-    http_client = AsyncHTTPClient()
-    http_client.fetch(request, on_response)
+    else:
+        logging.debug(f'successfully took snapshot for camera with id {camera_id}')
 
 
 def is_motion_detected(camera_id):
@@ -319,7 +332,7 @@ def set_motion_detected(camera_id, motion_detected):
 
 
 def camera_id_to_motion_camera_id(camera_id):
-    import config
+    from motioneye import config
 
     # find the corresponding motion camera_id
     # (which can be different from camera_id)
@@ -338,13 +351,15 @@ def camera_id_to_motion_camera_id(camera_id):
 
 
 def motion_camera_id_to_camera_id(motion_camera_id):
-    import config
+    from motioneye import config
 
     main_config = config.get_main()
     cameras = main_config.get('camera', [])
 
     try:
-        return int(re.search(r'camera-(\d+).conf', cameras[int(motion_camera_id) - 1]).group(1))
+        return int(
+            re.search(r'camera-(\d+).conf', cameras[int(motion_camera_id) - 1]).group(1)
+        )
 
     except IndexError:
         return None
@@ -377,6 +392,7 @@ def has_h264_v4l2m2m_support():
 
     return 'h264_v4l2m2m' in codecs.get('h264', {}).get('encoders', set())
 
+
 def has_h264_nvenc_support():
     binary, version, codecs = mediafiles.find_ffmpeg()
     if not binary:
@@ -385,6 +401,7 @@ def has_h264_nvenc_support():
     # TODO also check for motion codec parameter support
 
     return 'h264_nvenc' in codecs.get('h264', {}).get('encoders', set())
+
 
 def has_h264_nvmpi_support():
     binary, version, codecs = mediafiles.find_ffmpeg()
@@ -395,6 +412,7 @@ def has_h264_nvmpi_support():
 
     return 'h264_nvmpi' in codecs.get('h264', {}).get('encoders', set())
 
+
 def has_hevc_nvmpi_support():
     binary, version, codecs = mediafiles.find_ffmpeg()
     if not binary:
@@ -403,6 +421,7 @@ def has_hevc_nvmpi_support():
     # TODO also check for motion codec parameter support
 
     return 'hevc_nvmpi' in codecs.get('hevc', {}).get('encoders', set())
+
 
 def has_hevc_nvenc_support():
     binary, version, codecs = mediafiles.find_ffmpeg()
@@ -413,6 +432,7 @@ def has_hevc_nvenc_support():
 
     return 'hevc_nvenc' in codecs.get('hevc', {}).get('encoders', set())
 
+
 def has_h264_qsv_support():
     binary, version, codecs = mediafiles.find_ffmpeg()
     if not binary:
@@ -422,6 +442,7 @@ def has_h264_qsv_support():
 
     return 'h264_qsv' in codecs.get('h264', {}).get('encoders', set())
 
+
 def has_hevc_qsv_support():
     binary, version, codecs = mediafiles.find_ffmpeg()
     if not binary:
@@ -430,6 +451,67 @@ def has_hevc_qsv_support():
     # TODO also check for motion codec parameter support
 
     return 'hevc_qsv' in codecs.get('hevc', {}).get('encoders', set())
+
+
+def has_h264_nvenc_support():
+    binary, version, codecs = mediafiles.find_ffmpeg()
+    if not binary:
+        return False
+
+    # TODO also check for motion codec parameter support
+
+    return 'h264_nvenc' in codecs.get('h264', {}).get('encoders', set())
+
+
+def has_h264_nvmpi_support():
+    binary, version, codecs = mediafiles.find_ffmpeg()
+    if not binary:
+        return False
+
+    # TODO also check for motion codec parameter support
+
+    return 'h264_nvmpi' in codecs.get('h264', {}).get('encoders', set())
+
+
+def has_hevc_nvmpi_support():
+    binary, version, codecs = mediafiles.find_ffmpeg()
+    if not binary:
+        return False
+
+    # TODO also check for motion codec parameter support
+
+    return 'hevc_nvmpi' in codecs.get('hevc', {}).get('encoders', set())
+
+
+def has_hevc_nvenc_support():
+    binary, version, codecs = mediafiles.find_ffmpeg()
+    if not binary:
+        return False
+
+    # TODO also check for motion codec parameter support
+
+    return 'hevc_nvenc' in codecs.get('hevc', {}).get('encoders', set())
+
+
+def has_h264_qsv_support():
+    binary, version, codecs = mediafiles.find_ffmpeg()
+    if not binary:
+        return False
+
+    # TODO also check for motion codec parameter support
+
+    return 'h264_qsv' in codecs.get('h264', {}).get('encoders', set())
+
+
+def has_hevc_qsv_support():
+    binary, version, codecs = mediafiles.find_ffmpeg()
+    if not binary:
+        return False
+
+    # TODO also check for motion codec parameter support
+
+    return 'hevc_qsv' in codecs.get('hevc', {}).get('encoders', set())
+
 
 def resolution_is_valid(width, height):
     # width & height must be be modulo 8
@@ -443,8 +525,8 @@ def resolution_is_valid(width, height):
     return True
 
 
-def _disable_initial_motion_detection():
-    import config
+async def _disable_initial_motion_detection():
+    from motioneye import config
 
     for camera_id in config.get_camera_ids():
         camera_config = config.get_camera(camera_id)
@@ -452,8 +534,10 @@ def _disable_initial_motion_detection():
             continue
 
         if not camera_config['@motion_detection']:
-            logging.debug('motion detection disabled by config for camera with id %s' % camera_id)
-            set_motion_detection(camera_id, False)
+            logging.debug(
+                'motion detection disabled by config for camera with id %s' % camera_id
+            )
+            await set_motion_detection(camera_id, False)
 
 
 def _get_pid():
@@ -461,8 +545,8 @@ def _get_pid():
 
     # read the pid from file
     try:
-        with open(motion_pid_path, 'r') as f:
+        with open(motion_pid_path) as f:
             return int(f.readline().strip())
 
-    except (IOError, ValueError):
+    except (OSError, ValueError):
         return None
